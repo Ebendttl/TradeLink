@@ -171,3 +171,83 @@
       (err u102))
     (err u101)))
 
+;; ----------------------------
+;; Dispute Resolution System
+;; ----------------------------
+(define-map disputes
+  { sale-id: uint }
+  { buyer: principal, seller: principal, reason: (string-ascii 1024), 
+    resolution-time: (optional uint), resolved: bool, arbiter-ruling: (optional bool) })
+
+(define-private (dispute-opened (sale-id uint) (reason (string-ascii 1024)))
+  true)
+
+(define-private (dispute-resolved (sale-id uint) (in-favor-of-buyer bool))
+  true)
+
+(define-public (open-dispute (sale-id uint) (reason (string-ascii 1024)))
+  (match (map-get? sales { sale-id: sale-id })
+    sale
+    (match (map-get? escrow { sale-id: sale-id })
+      escrow-data
+      (if (and (is-eq (get buyer escrow-data) tx-sender)
+               (not (get released escrow-data))
+               (< (- (default-to u0 (get-block-info? time u0)) (get sale-time sale)) u604800)) ;; 7 days in seconds
+        (begin
+          (map-insert disputes { sale-id: sale-id }
+                     { buyer: (get buyer escrow-data), 
+                      seller: (get seller escrow-data), 
+                      reason: reason,
+                      resolution-time: none,
+                      resolved: false, 
+                      arbiter-ruling: none })
+          (dispute-opened sale-id reason)
+          (ok true))
+        (err u400)) ;; Cannot open dispute: either not the buyer, funds already released, or past 7-day window
+      (err u401)) ;; No escrow record found
+    (err u402)) ;; No sale record found
+  )
+
+(define-public (resolve-dispute (sale-id uint) (in-favor-of-buyer bool))
+  (begin 
+    (asserts! (is-owner) (err u403)) ;; Only owner can resolve disputes
+    (match (map-get? disputes { sale-id: sale-id })
+      dispute
+      (if (not (get resolved dispute))
+        (match (map-get? escrow { sale-id: sale-id })
+          escrow-data
+          (begin
+            ;; Update dispute record
+            (map-set disputes { sale-id: sale-id }
+                     { buyer: (get buyer dispute),
+                       seller: (get seller dispute),
+                       reason: (get reason dispute),
+                       resolution-time: (some (default-to u0 (get-block-info? time u0))),
+                       resolved: true,
+                       arbiter-ruling: (some in-favor-of-buyer) })
+            
+            ;; If in favor of buyer, refund
+            (if in-favor-of-buyer
+              (begin
+                (try! (stx-transfer? (get amount escrow-data) (var-get owner) (get buyer dispute)))
+                (map-set sales { sale-id: sale-id }
+                         (merge (unwrap-panic (map-get? sales { sale-id: sale-id }))
+                                { refunded: true }))
+                (refund-issued sale-id 
+                              (get item-id (unwrap-panic (map-get? sales { sale-id: sale-id })))
+                              (get buyer dispute)))
+              ;; Otherwise, release funds to seller
+              (begin
+                (map-set escrow { sale-id: sale-id }
+                        { buyer: (get buyer escrow-data),
+                          seller: (get seller escrow-data),
+                          amount: (get amount escrow-data),
+                          released: true })
+                (escrow-released sale-id (get buyer escrow-data) (get seller escrow-data))))
+            
+            (dispute-resolved sale-id in-favor-of-buyer)
+            (ok true))
+          (err u404)) ;; No escrow record found
+        (err u405)) ;; Dispute already resolved
+      (err u406)) ;; No dispute record found
+    ))
