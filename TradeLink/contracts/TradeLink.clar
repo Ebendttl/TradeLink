@@ -1,5 +1,12 @@
-;; TradeLink: Decentralized Marketplace Protocol (v2 Modular)
-;; Description: Evolved into a composable protocol layer with 8 integration modules.
+;; TradeLink: Decentralized Marketplace Protocol (v2 Hardened)
+;; Description: Production-grade modular marketplace with security hardening.
+
+;; ----------------------------
+;; Traits
+;; ----------------------------
+(use-trait payment-trait .payment-trait.payment-trait)
+(use-trait escrow-trait .escrow-trait.escrow-trait)
+(use-trait reputation-trait .reputation-trait.reputation-trait)
 
 ;; ----------------------------
 ;; Constants & Errors
@@ -14,6 +21,7 @@
 (define-constant ERR-ITEM-UNAVAILABLE (err u102))
 (define-constant ERR-ACCESS-DENIED (err u103))
 (define-constant ERR-REPUTATION-LOW (err u104))
+(define-constant ERR-PAUSED (err u105))
 
 ;; ----------------------------
 ;; Data Maps
@@ -30,10 +38,10 @@
     refunded: bool })
 
 ;; ----------------------------
-;; Read-Only Functions
+;; Internal Helpers
 ;; ----------------------------
-(define-read-only (get-item (item-id uint))
-  (map-get? items { item-id: item-id }))
+(define-private (check-not-paused (module-name (string-ascii 32)))
+  (asserts! (not (contract-call? .circuit-breaker is-paused module-name)) ERR-PAUSED))
 
 ;; ----------------------------
 ;; Item Management
@@ -41,57 +49,73 @@
 (define-public (add-item (name (string-ascii 256)) (description (string-ascii 1024)) (price uint)
                           (category (string-ascii 128)) (image-url (string-ascii 2048)) (quantity uint))
   (begin
-    ;; 1. Access Control Check
+    ;; 1. Security Checklist
+    (try! (check-not-paused "marketplace"))
     (asserts! (not (unwrap-panic (contract-call? .access-control is-blacklisted tx-sender))) ERR-ACCESS-DENIED)
     
-    (asserts! (>= quantity u1) (err u200))
+    ;; 2. Protocol Guard Validation
+    (try! (contract-call? .protocol-guard validate-listing price quantity))
+    
     (let ((new-id (var-get next-item-id)))
       (map-insert items { item-id: new-id }
                   { seller: tx-sender, name: name, description: description, price: price,
                     sold: false, category: category, image-url: image-url, quantity: quantity })
       (var-set next-item-id (+ new-id u1))
+      
+      ;; 3. Standardized Event Logging
+      (try! (contract-call? .event-registry log-listing new-id tx-sender price category))
+      
       (ok new-id))))
 
 ;; ----------------------------
-;; Sales Implementation
+;; Sales Implementation (Hardened)
 ;; ----------------------------
-(define-public (buy-item (item-id uint))
+(define-public (buy-item (item-id uint) (payment-p <payment-trait>) (escrow-p <escrow-trait>))
   (let ((item (unwrap! (map-get? items { item-id: item-id }) ERR-ITEM-NOT-FOUND))
         (buyer tx-sender)
         (seller (get seller item))
-        (price (get price item)))
+        (price (get price item))
+        (payment-addr (contract-of payment-p))
+        (escrow-addr (contract-of escrow-p)))
     (begin
-      ;; 1. Access Control & Reputation Checks
+      ;; 1. Security Checklist
+      (try! (check-not-paused "marketplace"))
       (asserts! (not (unwrap-panic (contract-call? .access-control is-blacklisted buyer))) ERR-ACCESS-DENIED)
-      ;; Optional: Check seller reputation for high-value items
-      (if (> price u1000000000) ;; > 1000 STX example
-          (asserts! (>= (get score (contract-call? .identity-reputation get-reputation seller)) u500) ERR-REPUTATION-LOW)
-          true)
+      
+      ;; 2. Dynamic Contract Registry Check (Ensuring we use authorized modules)
+      (asserts! (is-eq (some payment-addr) (contract-call? .contract-registry get-contract-address "payment-processor")) ERR-NOT-AUTHORIZED)
+      (asserts! (is-eq (some escrow-addr) (contract-call? .contract-registry get-contract-address "escrow-manager")) ERR-NOT-AUTHORIZED)
+
+      ;; 3. Advanced Reputation Check
+      (asserts! (>= (unwrap-panic (contract-call? .reputation-oracle get-score seller)) u300) ERR-REPUTATION-LOW)
 
       (if (and (is-eq (get sold item) false) (> (get quantity item) u0))
         (let ((platform-fee (/ (* price (var-get platform-fee-percentage)) u100))
               (seller-amount (- price platform-fee))
-              (sale-id (var-get next-sale-id)))
+              (sale-id (var-get next-sale-id))
+              (expiry (contract-call? .time-utils get-expiry u1440))) ;; 10 days approx
           (begin
-            ;; 2. Payment Processing (Unified STX/Token via payment-processor)
-            (try! (contract-call? .payment-processor lock-funds-stx price))
+            ;; 4. Payment & Treasury Routing
+            (try! (contract-call? payment-p lock-funds price (as-contract tx-sender)))
+            (try! (contract-call? .treasury-vault deposit-fees platform-fee))
             
-            ;; 3. Escrow Creation
-            (try! (contract-call? .escrow-manager create-escrow seller (var-get owner) seller-amount (+ block-height u1440) (list price)))
+            ;; 5. Advanced Escrow with Time Utils
+            (try! (contract-call? escrow-p create-escrow seller (var-get owner) seller-amount expiry (list price)))
             
-            ;; 4. Update State
+            ;; 6. State Update
             (map-set items { item-id: item-id }
                     (merge item { quantity: (- (get quantity item) u1), 
                                  sold: (is-eq (- (get quantity item) u1) u0) }))
             
             (map-insert sales { sale-id: sale-id }
                               { item-id: item-id, buyer: buyer, sale-price: price, 
-                                sale-time: (default-to u0 (get-block-info? time u0)), refunded: false })
+                                sale-time: (contract-call? .time-utils get-now), refunded: false })
             
             (var-set next-sale-id (+ sale-id u1))
 
-            ;; 5. Complementary Services
+            ;; 7. Post-Sale Services
             (try! (contract-call? .purchase-nft mint-receipt buyer sale-id item-id))
+            (try! (contract-call? .event-registry log-sale sale-id item-id buyer seller price))
             (try! (contract-call? .market-analytics record-purchase seller price (get category item)))
             (try! (contract-call? .loyalty-rewards award-points buyer u10))
             
@@ -103,9 +127,12 @@
 ;; ----------------------------
 (define-public (open-dispute (sale-id uint) (reason (string-ascii 256)))
   (begin
+    (try! (check-not-paused "governance"))
     ;; Delegate to Escrow Manager and DAO
     (try! (contract-call? .escrow-manager dispute-escrow sale-id))
-    (contract-call? .marketplace-dao submit-dispute-proposal sale-id reason)))
+    (try! (contract-call? .marketplace-dao submit-dispute-proposal sale-id reason))
+    (try! (contract-call? .event-registry log-dispute sale-id tx-sender reason))
+    (ok true)))
 
 ;; ----------------------------
 ;; Admin
@@ -114,3 +141,8 @@
   (begin
     (asserts! (is-eq tx-sender (var-get owner)) ERR-NOT-AUTHORIZED)
     (ok (var-set platform-fee-percentage new-fee))))
+
+(define-public (withdraw-collected-fees (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get owner)) ERR-NOT-AUTHORIZED)
+    (contract-call? .treasury-vault withdraw-all recipient)))
