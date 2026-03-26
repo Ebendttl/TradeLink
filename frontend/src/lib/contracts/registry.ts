@@ -1,6 +1,5 @@
 import { openContractCall } from '@stacks/connect';
 import { 
-  StandardPrincipalSelector, 
   callReadOnlyFunction, 
   cvToJSON, 
   stringAsciiCV,
